@@ -219,6 +219,7 @@ internal class WsTransport(
             connected.set(false)
             connectionHealth.stop()
             shouldOpen = networkAvailable && AuthManager.isAutoReconnect()
+            rpcChannel.clearCapabilityRequests()
             rpcChannel.rejectAllPending()
             _connectionStatus.value =
                 when {
@@ -412,6 +413,9 @@ internal class WsTransport(
     ): String {
         val id = request.id
         val method = request.method
+        // #416: room RPCs belong to the current authenticated socket. Never carry them across reconnects.
+        // In particular, only the room controller may explicitly retry a send using its original event id.
+        val hostedRoomCall = method.startsWith("groups.")
         val json = rpcChannel.encodeRequest(request)
         if (BuildConfig.DEBUG) {
             Log.d(TAG, formatSafeOutgoingFrameLog(id, method, request.params.keys, json.length, queued = false))
@@ -428,6 +432,10 @@ internal class WsTransport(
                 if (ws.send(json)) {
                     onSent?.invoke(id)
                 } else {
+                    if (hostedRoomCall) {
+                        recoverRejectedSocket(ws)
+                        throw HermesWsClient.HermesRpcException("Hosted room socket rejected the request")
+                    }
                     if (webSocket !== ws || !acceptQueuedMessages.get()) return@synchronized
                     if (queueIfDisconnected && isRetryableMessage(json)) {
                         onSent?.invoke(id)
@@ -438,6 +446,8 @@ internal class WsTransport(
                         Log.w(TAG, "WS rejected oversized outgoing message — not retrying")
                     }
                 }
+            } else if (hostedRoomCall) {
+                throw HermesWsClient.HermesRpcException("Hosted rooms require a connected socket")
             } else if (acceptQueuedMessages.get() && queueIfDisconnected) {
                 if (isRetryableMessage(json)) {
                     onSent?.invoke(id)
@@ -541,19 +551,24 @@ internal class WsTransport(
         onSent: ((String) -> Unit)? = null,
         queued: Boolean = false,
     ): String =
-        send(
-            rpcChannel.createRequest(
-                method = RpcMethods.PROMPT_SUBMIT.name,
-                params =
-                    PromptSubmitParams(
-                        sessionId = sessionId,
-                        text = text,
-                        queued = queued.takeIf { it },
-                        clarifyBatch = true.takeIf { rpcChannel.canonicalClarifyBatch },
-                    ).let { rpcChannel.encodeParams(RpcMethods.PROMPT_SUBMIT, it) },
-            ),
-            onSent = onSent,
-        )
+        synchronized(outboundLock) {
+            send(
+                rpcChannel.createRequest(
+                    method = RpcMethods.PROMPT_SUBMIT.name,
+                    params =
+                        PromptSubmitParams(
+                            sessionId = sessionId,
+                            text = text,
+                            queued = queued.takeIf { it },
+                            clarifyBatch =
+                                true.takeIf {
+                                    rpcChannel.sessionAuthority && rpcChannel.canonicalClarifyBatch
+                                },
+                        ).let { rpcChannel.encodeParams(RpcMethods.PROMPT_SUBMIT, it) },
+                ),
+                onSent = onSent,
+            )
+        }
 
     fun sendRedirect(
         sessionId: String,
@@ -576,6 +591,7 @@ internal class WsTransport(
         val generation =
             synchronized(outboundLock) {
                 if (intentionalClose.get()) return
+                rpcChannel.clearCapabilityRequests()
                 connectionGeneration.incrementAndGet()
             }
         val job =
@@ -705,10 +721,12 @@ internal class WsTransport(
             webSocket: WebSocket,
             text: String,
         ) {
-            if (!isCurrent() || this@WsTransport.webSocket !== webSocket) return
-            if (BuildConfig.DEBUG) Log.d(TAG, formatSafeIncomingFrameLog(text))
-            connectionHealth.onInboundFrame()
-            onRawMessage(text)
+            synchronized(outboundLock) {
+                if (!isCurrent() || this@WsTransport.webSocket !== webSocket) return
+                if (BuildConfig.DEBUG) Log.d(TAG, formatSafeIncomingFrameLog(text))
+                connectionHealth.onInboundFrame()
+                onRawMessage(text)
+            }
         }
 
         override fun onClosing(
